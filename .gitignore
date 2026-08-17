@@ -7,6 +7,9 @@ __pycache__/
 
 # Development tests and diagnostic scripts
 Tests/
+# Backups
+backup/
+backup2/
 
 # Editor files
 .vscode/

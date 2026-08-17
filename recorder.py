@@ -1022,6 +1022,7 @@ class Recorder:
         )
 
 
+   
     # -----------------------------------------------------------------------
     # Stop the entire recording session
     # -----------------------------------------------------------------------
@@ -1033,10 +1034,18 @@ class Recorder:
         The current part is closed cleanly.
 
         No new part is created.
+
+        Returns:
+
+            True
+                Recording files were closed.
+
+            False
+                Recorder was not active.
         """
 
         if not self.recording:
-            return
+            return False
 
 
         completed_part = (
@@ -1044,15 +1053,65 @@ class Recorder:
         )
 
 
+        # ---------------------------------------------------------------
+        # Tell the system log that file closure has begun.
+        # ---------------------------------------------------------------
+
+        logger.info(
+            f"Closing WAV files for Part "
+            f"{completed_part}"
+        )
+
+
+        print(
+            "Closing WAV files..."
+        )
+
+
+        # ---------------------------------------------------------------
         # Close all currently open WAV files.
+        # ---------------------------------------------------------------
+        #
+        # This is important because the WAV headers contain the final
+        # data size. wave.close() writes the completed header.
+
         self._close_wav_files()
 
 
+        # ---------------------------------------------------------------
         # Mark recording as stopped.
+        # ---------------------------------------------------------------
+
         self.recording = False
 
 
-        # Log the event.
+        # ---------------------------------------------------------------
+        # Log successful closure.
+        # ---------------------------------------------------------------
+
+        logger.info(
+            f"WAV files closed for Part "
+            f"{completed_part}"
+        )
+
+
+        print(
+            "WAV files closed."
+        )
+
+
+        # ---------------------------------------------------------------
+        # Reset active-part information.
+        # ---------------------------------------------------------------
+
+        self.part_dir = None
+        self.part_frames_written = 0
+
+
+        # ---------------------------------------------------------------
+        # Log the completed recording session.
+        # ---------------------------------------------------------------
+
         logger.info(
             f"Recording session stopped: "
             f"{self.session_dir} "
@@ -1060,17 +1119,12 @@ class Recorder:
         )
 
 
-        print()
         print(
             "Recording stopped."
         )
-        print()
 
 
-        # Reset the active-part information.
-        self.part_dir = None
-        self.part_frames_written = 0
-
+        return True
 
     # -----------------------------------------------------------------------
     # Safety cleanup

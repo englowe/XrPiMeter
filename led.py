@@ -419,25 +419,25 @@ class LEDs:
 
 
 
-def xr18_disconnected(self, usb_available=False):
-    """
-    Display the safe idle state when the XR18 is disconnected.
+    def xr18_disconnected(self, usb_available=False):
+        """
+        Display the safe idle state when the XR18 is disconnected.
 
-    Channel LEDs are cleared because their previous audio levels
-    are no longer meaningful. Recording is also stopped.
-    """
+        Channel LEDs are cleared because their previous audio levels
+        are no longer meaningful. Recording is also stopped.
+        """
 
-    self._update_rec_led(False)
-    self._update_usb_led(usb_available)
+        self._update_rec_led(False)
+        self._update_usb_led(usb_available)
 
-    for channel in range(18):
+        for channel in range(18):
 
-        self._set_pixel(
-            CHANNEL_LED_START + channel,
-            OFF,
-        )
+            self._set_pixel(
+                CHANNEL_LED_START + channel,
+                OFF,
+            )
 
-    self._show()
+        self._show()
 
 
     # -----------------------------------------------------------------------
