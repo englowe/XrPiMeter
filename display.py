@@ -1181,7 +1181,7 @@ class Display:
             recording_time_text = (
                 f"{LABEL_REC}: "
                 f"{elapsed_text} "
-                f"({remaining_text})"
+                f"{remaining_text}"
             )
 
             self.text(

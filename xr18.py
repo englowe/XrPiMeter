@@ -36,6 +36,7 @@ the device whose description contains X18 or XR18.
 
 import re
 import subprocess
+import time
 
 import alsaaudio
 
@@ -120,7 +121,7 @@ class XR18:
     def __init__(self):
 
         # ALSA device name.
-
+        #
         # Example:
         #
         #     hw:2,0
@@ -267,9 +268,15 @@ class XR18:
 
             # Open the ALSA capture device using the configuration required
             # by XRPimeter.
+            #
+            # NONBLOCK is important here.
+            #
+            # If the XR18 is unplugged, a blocking ALSA read could prevent
+            # the main XRPimeter loop from running. Non-blocking mode lets
+            # main.py continue operating and detect the disconnected device.
             self.audio = alsaaudio.PCM(
                 type=alsaaudio.PCM_CAPTURE,
-                mode=alsaaudio.PCM_NORMAL,
+                mode=alsaaudio.PCM_NONBLOCK,
                 device=self.device_name,
                 channels=CHANNELS,
                 rate=SAMPLE_RATE,
@@ -282,21 +289,27 @@ class XR18:
             # Verify that actual audio can be read
             # ---------------------------------------------------------------
             #
-            # An ALSA device can appear in the device list even when it
-            # isn't currently capable of supplying audio.
+            # With non-blocking ALSA, audio may not be available immediately.
             #
-            # Therefore we perform one real read before declaring the
-            # connection successful.
-
-            length, data = self.audio.read()
-
-
-            # A zero-length result during initial connection isn't useful
-            # enough to declare the device working.
+            # Therefore we give the XR18 a short period to provide its first
+            # block rather than treating an initial empty read as failure.
             #
-            # This is different from the normal read() method below,
-            # where a temporary zero-frame read is simply ignored.
-            if length <= 0 or not data:
+            # 20 attempts × 10 ms = approximately 200 ms.
+
+            for _ in range(20):
+
+                length, data = self.audio.read()
+
+                if length > 0 and data:
+
+                    break
+
+
+                time.sleep(
+                    0.01
+                )
+
+            else:
 
                 self.disconnect()
 
@@ -366,7 +379,7 @@ class XR18:
 
             (0, b"")
 
-                when ALSA temporarily returns zero frames.
+                when ALSA temporarily has no audio available.
 
                 This is NOT treated as a disconnection.
 
@@ -374,19 +387,8 @@ class XR18:
 
                 when an actual ALSA error occurs.
 
-        This distinction is important.
-
-        During testing we discovered that the XR18 can occasionally return:
-
-            length = 0
-            data   = None
-
-        without producing an ALSA error.
-
-        That does not necessarily mean the XR18 has disconnected.
-
-        Therefore main.py must not restart the XR18 merely because one
-        read contains zero frames.
+        Non-blocking capture is deliberately used so that an XR18
+        disconnection cannot freeze the main application loop.
         """
 
         # If there is no open ALSA device, there is nothing to read.
@@ -398,6 +400,9 @@ class XR18:
         try:
 
             # Ask ALSA for the next block of audio.
+            #
+            # Because the PCM device is non-blocking, this returns
+            # immediately if no audio is currently available.
             length, data = self.audio.read()
 
 
@@ -406,7 +411,7 @@ class XR18:
             # We deliberately DO NOT set connected = False here.
             #
             # The XR18 may immediately provide audio on the next read,
-            # which is exactly what we observed during testing.
+            # which is normal with non-blocking capture.
             if length <= 0:
 
                 return 0, b""
@@ -418,8 +423,6 @@ class XR18:
 
         except alsaaudio.ALSAAudioError as error:
 
-            # This is different from a zero-frame read.
-            #
             # ALSA has actually reported a capture error, so the XR18
             # should be considered unavailable.
             print(

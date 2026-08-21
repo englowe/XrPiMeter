@@ -59,8 +59,10 @@ amount of audio that could be affected by a failure.
 """
 
 import shutil
+import time
 import wave
 from pathlib import Path
+
 
 import numpy as np
 
@@ -173,8 +175,124 @@ class Recorder:
         # The time at which the recording session started.
         self.session_start_time = None
 
+        self.session_start_monotonic = None
 
-    # -----------------------------------------------------------------------
+
+    def get_elapsed_seconds(self):
+        """
+        Return elapsed time since the recording session started.
+
+        Uses monotonic time so NTP/system-clock changes cannot affect it.
+        """
+
+        if self.session_start_monotonic is None:
+            return 0
+
+        return int(
+            time.monotonic()
+            - self.session_start_monotonic
+        )
+
+    def get_recording_size_gb(self):
+        """
+        Return the total size of the current recording session in GB.
+
+        Includes all completed and currently active WAV files.
+        """
+
+        if self.session_dir is None:
+            return 0.0
+
+        try:
+
+            total_bytes = 0
+
+            for path in self.session_dir.rglob("*"):
+
+                if path.is_file():
+
+                    total_bytes += (
+                        path.stat().st_size
+                    )
+
+            return (
+                total_bytes
+                / 1_000_000_000
+            )
+
+        except OSError:
+
+            return 0.0
+
+
+    def get_free_space_gb(self):
+        """
+        Return the currently available filesystem space in GB.
+        """
+
+        try:
+
+            usage = shutil.disk_usage(
+                self.recordings_root
+            )
+
+            return (
+                usage.free
+                / 1_000_000_000
+            )
+
+        except OSError:
+
+            return 0.0
+
+
+    def get_remaining_seconds(self):
+        """
+        Return the estimated remaining recording time in seconds.
+        """
+
+        hours = self._get_free_recording_hours()
+
+        if hours is None:
+            return 0
+
+        return int(
+            hours * 3600
+        )
+
+    def get_folder_path(self):
+        """
+        Return the recording path for display.
+
+        The Linux mount point (/media/pi/) is hidden, while the USB
+        volume name and XRPimeter recording path remain visible.
+        """
+
+        if self.part_dir is None:
+            return ""
+
+        try:
+
+            mount_point = (
+                self.recordings_root.parent
+            )
+
+            relative_path = (
+                self.part_dir.relative_to(
+                    mount_point.parent
+                )
+            )
+
+            return str(
+                relative_path
+            )
+
+        except ValueError:
+
+            return str(
+                self.part_dir.name
+            )
+    # ----------------------------------------------------------
     # Start a recording session
     # -----------------------------------------------------------------------
 
@@ -194,6 +312,9 @@ class Recorder:
             True  = recording session successfully started
             False = recording session could not be started
         """
+
+        self.session_start_monotonic = time.monotonic()
+
 
         # Ask the time-status module for one complete snapshot.
         #
@@ -252,6 +373,7 @@ class Recorder:
             session_name = (
                 f"Session {session_number}"
             )
+
 
 
         self.session_dir = (
@@ -363,6 +485,9 @@ class Recorder:
         return True
 
 
+    
+
+
     # -----------------------------------------------------------------------
     # Find the next available session number
     # -----------------------------------------------------------------------
@@ -412,50 +537,20 @@ class Recorder:
         self.part_number += 1
 
 
-        # Get the current time.
 
-        # We only use this timestamp if the clock was already considered
-        # valid when the session began.
-        #
-        # If the session started with an invalid clock, we continue using
-        # simple Part 1 / Part 2 naming for the entire session.
-        part_time_status = get_time_status()
-
-        part_time = (
-            part_time_status["current_time"]
-        )
 
 
         # -------------------------------------------------------------------
         # Determine the part directory name
         # -------------------------------------------------------------------
 
-        if self.time_valid:
-
-            # Example:
-            #
-            #     Part 1 - 12_08_2026_19-42-16
-            #
-            timestamp = format_filename_time(
-                part_time
-            )
-
-            part_name = (
-                f"Part {self.part_number} - {timestamp}"
-            )
-
-        else:
-
-            # No trustworthy clock, so use a simple part number.
-            part_name = (
-                f"Part {self.part_number}"
-            )
-
+        part_name = (
+            f"Part {self.part_number}"
+        )
 
         self.part_dir = (
             self.session_dir / part_name
         )
-
 
         # -------------------------------------------------------------------
         # Create the part directory

@@ -503,3 +503,74 @@ def usb_is_available(mount_point):
 
 
     return mount_point.is_dir()
+
+
+
+def get_usb_name(mount_point):
+    """
+    Return the filesystem label for the mounted USB storage.
+
+    Returns an empty string if the label cannot be determined.
+    """
+
+    if mount_point is None:
+        return ""
+
+    try:
+
+        result = subprocess.run(
+            [
+                "lsblk",
+                "-J",
+                "-o",
+                "NAME,LABEL,MOUNTPOINTS",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        data = json.loads(
+            result.stdout
+        )
+
+    except (
+        subprocess.SubprocessError,
+        OSError,
+        json.JSONDecodeError,
+    ):
+
+        return ""
+
+    target = str(
+        mount_point
+    )
+
+    for device in data.get(
+        "blockdevices",
+        []
+    ):
+
+        for partition in device.get(
+            "children",
+            []
+        ):
+
+            mount_points = (
+                partition.get(
+                    "mountpoints",
+                    []
+                )
+                or []
+            )
+
+            if target in mount_points:
+
+                return (
+                    partition.get(
+                        "label"
+                    )
+                    or ""
+                )
+
+    return ""
