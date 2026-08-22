@@ -349,7 +349,7 @@ class Display:
         for start in range(
             0,
             len(values),
-            32,
+            16,
         ):
 
             chunk = values[

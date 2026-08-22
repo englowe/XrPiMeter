@@ -1,10 +1,7 @@
 """
 XRPimeter process supervisor.
 
-The supervisor starts and monitors the independent XRPimeter
-processes.
-
-Current proof-of-concept architecture:
+Architecture:
 
     Supervisor
         |
@@ -12,82 +9,303 @@ Current proof-of-concept architecture:
         |
         +---- UI process
 
-The recorder sends small status messages to the UI through a
-multiprocessing.Queue.
+The recorder sends small status snapshots to the UI.
 
-Audio data is NOT sent through the queue.
+Audio data NEVER passes through the queue.
+
+The supervisor:
+
+    - starts the recorder
+    - starts the UI
+    - monitors both
+    - restarts the UI if required
+    - detects recorder failure
+    - requests orderly shutdown
+    - force-kills a process only as a final fallback
 """
 
-
 import multiprocessing
+import signal
 import time
+
 
 from processes.recorder_process import run_recorder
 from processes.ui_process import run_ui
 
 
+# ---------------------------------------------------------------------------
+# Timing
+# ---------------------------------------------------------------------------
+
+SUPERVISOR_CHECK_INTERVAL = 1.0
+
+PROCESS_SHUTDOWN_TIMEOUT = 10.0
+
+FORCE_TERMINATE_TIMEOUT = 2.0
+
+
+# ---------------------------------------------------------------------------
+# Shutdown state
+# ---------------------------------------------------------------------------
+
+shutdown_requested = False
+
+
+# ---------------------------------------------------------------------------
+# Signal handler
+# ---------------------------------------------------------------------------
+
+def request_shutdown(
+    signum=None,
+    frame=None,
+):
+    """
+    Request supervisor shutdown.
+
+    The signal handler deliberately does not touch child processes.
+    """
+
+    global shutdown_requested
+
+    shutdown_requested = True
+
+
+# ---------------------------------------------------------------------------
+# Process creation
+# ---------------------------------------------------------------------------
+
+def create_recorder_process(
+    status_queue,
+    shutdown_event,
+):
+    """
+    Create the recorder process.
+    """
+
+    return multiprocessing.Process(
+
+        target=run_recorder,
+
+        args=(
+            status_queue,
+            shutdown_event,
+        ),
+
+        name="xrpimeter-recorder",
+    )
+
+
+def create_ui_process(
+    status_queue,
+    shutdown_event,
+):
+    """
+    Create the UI process.
+    """
+
+    return multiprocessing.Process(
+
+        target=run_ui,
+
+        args=(
+            status_queue,
+            shutdown_event,
+        ),
+
+        name="xrpimeter-ui",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Process shutdown
+# ---------------------------------------------------------------------------
+
+def request_process_shutdown(
+    process,
+):
+    """
+    Wait for a process to shut down.
+
+    The process should already have been told to shut down through the
+    shared shutdown Event.
+
+    SIGTERM is NOT used as the normal shutdown mechanism.
+
+    If the process refuses to exit, terminate() is used.
+
+    If terminate() somehow fails to stop it, kill() is the final fallback.
+    """
+
+    if process is None:
+        return
+
+    if process.pid is None:
+        return
+
+    if not process.is_alive():
+
+        print(
+            f"{process.name} already stopped.",
+            flush=True,
+        )
+
+        return
+
+    print(
+        f"Waiting for "
+        f"{process.name} "
+        f"(PID {process.pid}) "
+        f"to shut down...",
+        flush=True,
+    )
+
+    # ---------------------------------------------------------------
+    # Normal graceful shutdown
+    # ---------------------------------------------------------------
+
+    process.join(
+        PROCESS_SHUTDOWN_TIMEOUT
+    )
+
+    if not process.is_alive():
+
+        print(
+            f"{process.name} stopped cleanly.",
+            flush=True,
+        )
+
+        return
+
+    # ---------------------------------------------------------------
+    # First emergency measure
+    # ---------------------------------------------------------------
+
+    print(
+        f"WARNING: {process.name} did not shut down "
+        f"within {PROCESS_SHUTDOWN_TIMEOUT:.0f} seconds.",
+        flush=True,
+    )
+
+    print(
+        f"Force terminating {process.name}...",
+        flush=True,
+    )
+
+    process.terminate()
+
+    process.join(
+        FORCE_TERMINATE_TIMEOUT
+    )
+
+    if not process.is_alive():
+
+        print(
+            f"{process.name} terminated.",
+            flush=True,
+        )
+
+        return
+
+    # ---------------------------------------------------------------
+    # Absolute final fallback
+    # ---------------------------------------------------------------
+
+    print(
+        f"ERROR: {process.name} survived terminate().",
+        flush=True,
+    )
+
+    print(
+        f"Force killing {process.name}...",
+        flush=True,
+    )
+
+    process.kill()
+
+    process.join(
+        FORCE_TERMINATE_TIMEOUT
+    )
+
+    if process.is_alive():
+
+        print(
+            f"ERROR: {process.name} is STILL alive.",
+            flush=True,
+        )
+
+    else:
+
+        print(
+            f"{process.name} killed.",
+            flush=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Supervisor
+# ---------------------------------------------------------------------------
+
 def main():
     """
-    Start and monitor the XRPimeter processes.
+    Start and monitor XRPimeter processes.
     """
+
+    global shutdown_requested
+
+    shutdown_requested = False
+
+    # -----------------------------------------------------------------------
+    # Signals
+    # -----------------------------------------------------------------------
+
+    signal.signal(
+        signal.SIGTERM,
+        request_shutdown,
+    )
+
+    signal.signal(
+        signal.SIGINT,
+        request_shutdown,
+    )
 
     print(
         "XRPimeter supervisor starting...",
         flush=True,
     )
 
-
     # -----------------------------------------------------------------------
-    # Recorder → UI status queue
+    # IPC
     # -----------------------------------------------------------------------
-    #
-    # This queue is only for small status messages.
-    #
-    # The recorder will eventually send things such as:
-    #
-    #     XR18 connection state
-    #     USB state
-    #     recording state
-    #     audio levels
-    #     elapsed recording time
-    #     remaining recording time
-    #
-    # We NEVER send the actual 18-channel audio through this queue.
-    #
 
     status_queue = multiprocessing.Queue()
 
+    shutdown_event = multiprocessing.Event()
 
     # -----------------------------------------------------------------------
-    # Create recorder process
+    # Create processes
     # -----------------------------------------------------------------------
 
-    recorder_process = multiprocessing.Process(
-        target=run_recorder,
-        args=(status_queue,),
-        name="xrpimeter-recorder",
+    recorder_process = (
+        create_recorder_process(
+            status_queue,
+            shutdown_event,
+        )
     )
 
-
-    # -----------------------------------------------------------------------
-    # Create UI process
-    # -----------------------------------------------------------------------
-
-    ui_process = multiprocessing.Process(
-        target=run_ui,
-        args=(status_queue,),
-        name="xrpimeter-ui",
+    ui_process = (
+        create_ui_process(
+            status_queue,
+            shutdown_event,
+        )
     )
 
-
     # -----------------------------------------------------------------------
-    # Start both processes
+    # Start processes
     # -----------------------------------------------------------------------
 
     recorder_process.start()
 
     ui_process.start()
-
 
     print(
         "Both processes started.",
@@ -112,18 +330,16 @@ def main():
         flush=True,
     )
 
-
     # -----------------------------------------------------------------------
-    # Monitor processes
+    # Monitor
     # -----------------------------------------------------------------------
 
     try:
 
-        while True:
-
+        while not shutdown_requested:
 
             # ---------------------------------------------------------------
-            # Check recorder
+            # Recorder
             # ---------------------------------------------------------------
 
             if not recorder_process.is_alive():
@@ -133,16 +349,18 @@ def main():
                     flush=True,
                 )
 
-                # The recorder is the primary function of XRPimeter.
-                #
-                # For now we simply stop the supervisor as well.
-                # Later we will implement proper critical-failure handling.
+                print(
+                    f"Recorder exit code: "
+                    f"{recorder_process.exitcode}",
+                    flush=True,
+                )
+
+                shutdown_requested = True
 
                 break
 
-
             # ---------------------------------------------------------------
-            # Check UI
+            # UI
             # ---------------------------------------------------------------
 
             if not ui_process.is_alive():
@@ -157,26 +375,22 @@ def main():
                     flush=True,
                 )
 
-
                 # -----------------------------------------------------------
-                # Create a completely new UI process.
+                # Create a new UI process.
+                #
+                # The Event is the SAME Event.
+                #
+                # It must NOT be set while we want the replacement UI to run.
                 # -----------------------------------------------------------
-                #
-                # A multiprocessing.Process object cannot be started again
-                # once it has stopped, so a new object must be created.
-                #
 
-                ui_process = multiprocessing.Process(
-                    target=run_ui,
-                    args=(status_queue,),
-                    name="xrpimeter-ui",
+                ui_process = (
+                    create_ui_process(
+                        status_queue,
+                        shutdown_event,
+                    )
                 )
 
-
-                # Start the replacement UI process.
-
                 ui_process.start()
-
 
                 print(
                     f"UI process restarted. "
@@ -184,64 +398,71 @@ def main():
                     flush=True,
                 )
 
-
             # ---------------------------------------------------------------
-            # Give the supervisor a short pause.
+            # Supervisor timing
             # ---------------------------------------------------------------
 
-            time.sleep(1)
-
+            time.sleep(
+                SUPERVISOR_CHECK_INTERVAL
+            )
 
     except KeyboardInterrupt:
 
+        shutdown_requested = True
+
+    finally:
+
         print(
-            "Supervisor stopping...",
+            "Supervisor shutting down...",
             flush=True,
         )
 
+        # -------------------------------------------------------------------
+        # Tell BOTH children to exit.
+        # -------------------------------------------------------------------
+        #
+        # This is the key change.
+        #
+        # We do not send SIGINT to the recorder.
+        #
 
-    finally:
+        shutdown_event.set()
 
         # -------------------------------------------------------------------
         # Stop recorder
         # -------------------------------------------------------------------
 
-        if recorder_process.is_alive():
-
-            print(
-                "Stopping recorder process...",
-                flush=True,
-            )
-
-            recorder_process.terminate()
-
-            recorder_process.join()
-
+        request_process_shutdown(
+            recorder_process
+        )
 
         # -------------------------------------------------------------------
         # Stop UI
         # -------------------------------------------------------------------
 
-        if ui_process.is_alive():
-
-            print(
-                "Stopping UI process...",
-                flush=True,
-            )
-
-            ui_process.terminate()
-
-            ui_process.join()
-
+        request_process_shutdown(
+            ui_process
+        )
 
         # -------------------------------------------------------------------
-        # Close status queue
+        # Queue cleanup
         # -------------------------------------------------------------------
 
-        status_queue.close()
+        try:
 
-        status_queue.join_thread()
+            status_queue.close()
 
+        except Exception:
+
+            pass
+
+        try:
+
+            status_queue.join_thread()
+
+        except Exception:
+
+            pass
 
         print(
             "Supervisor stopped.",
@@ -250,7 +471,7 @@ def main():
 
 
 # ---------------------------------------------------------------------------
-# Program entry point
+# Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
