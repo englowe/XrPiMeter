@@ -165,6 +165,8 @@ class Recorder:
         # have been written.
         self.part_frames_written = 0
 
+        self.total_frames_written = 0
+
         # Whether the system clock was considered valid when the session
         # began.
         self.time_valid = False
@@ -816,9 +818,13 @@ class Recorder:
 
             frames_written = len(samples)
 
+            self.total_frames_written += frames_written
+
             self.part_frames_written += (
                 frames_written
             )
+
+
 
 
         except (
