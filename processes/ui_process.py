@@ -38,10 +38,10 @@ def run_ui(status_queue):
 
                 status = status_queue.get_nowait()
 
-                print(
-                    f"UI RECEIVED STATUS: {status}",
-                    flush=True,
-                )
+              #  print(
+              #      f"UI RECEIVED STATUS: {status}",
+              #      flush=True,
+              #  )
 
             except Exception:
 

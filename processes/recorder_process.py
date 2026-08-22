@@ -46,6 +46,15 @@ USB_CHECK_INTERVAL = 1.0
 
 
 # ---------------------------------------------------------------------------
+# Audio configuration
+# ---------------------------------------------------------------------------
+
+CHANNELS = 18
+
+BYTES_PER_SAMPLE = 4
+
+
+# ---------------------------------------------------------------------------
 # Start recorder
 # ---------------------------------------------------------------------------
 
@@ -99,6 +108,107 @@ def start_recorder(usb_mount_point):
 
 
     return recorder
+
+
+# ---------------------------------------------------------------------------
+# Print audio diagnostics
+# ---------------------------------------------------------------------------
+
+def print_audio_diagnostics(
+    xr18_frames,
+    recorder,
+):
+    """
+    Print a comparison between the number of audio frames received from
+    the XR18 and the number of frames written by Recorder.
+
+    Both values represent one complete 18-channel audio frame.
+    """
+
+    if recorder is None:
+        return
+
+
+    recorder_frames = (
+        recorder.total_frames_written
+    )
+
+
+    difference = (
+        xr18_frames
+        - recorder_frames
+    )
+
+
+    xr18_duration = (
+        xr18_frames / 48000
+    )
+
+
+    recorder_duration = (
+        recorder_frames / 48000
+    )
+
+
+    print(
+        "",
+        flush=True,
+    )
+
+    print(
+        "========================================",
+        flush=True,
+    )
+
+    print(
+        "RECORDER AUDIO DIAGNOSTICS",
+        flush=True,
+    )
+
+    print(
+        "========================================",
+        flush=True,
+    )
+
+    print(
+        f"XR18 frames received:     "
+        f"{xr18_frames:,}",
+        flush=True,
+    )
+
+    print(
+        f"Recorder frames written:  "
+        f"{recorder_frames:,}",
+        flush=True,
+    )
+
+    print(
+        f"Difference:               "
+        f"{difference:,}",
+        flush=True,
+    )
+
+    print(
+        f"XR18 duration:            "
+        f"{xr18_duration:.3f} seconds",
+        flush=True,
+    )
+
+    print(
+        f"Recorded duration:        "
+        f"{recorder_duration:.3f} seconds",
+        flush=True,
+    )
+
+    print(
+        "========================================",
+        flush=True,
+    )
+
+    print(
+        "",
+        flush=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -158,19 +268,23 @@ def run_recorder(status_queue):
     # Audio diagnostics
     # -----------------------------------------------------------------------
     #
-    # These counters measure the amount of audio arriving from the XR18.
+    # This counts complete 18-channel audio frames received from the XR18
+    # during the CURRENT recording session.
     #
-    # They are deliberately independent of the recorder.
+    # It is deliberately separate from Recorder's own frame counter.
     #
-    # This will help us determine whether audio is being lost before
-    # Recorder.write() receives it.
+    # This lets us compare:
+    #
+    #     XR18 frames received
+    #
+    # against:
+    #
+    #     Recorder frames written
+    #
+    # A difference indicates that frames were lost between those two points.
     #
 
-    total_audio_bytes = 0
-
-    total_audio_reads = 0
-
-    last_diagnostic_time = time.monotonic()
+    session_xr18_frames = 0
 
 
     try:
@@ -216,6 +330,14 @@ def run_recorder(status_queue):
                                 )
 
 
+                                if recorder is not None:
+
+                                    # Start counting frames for this
+                                    # recording session from zero.
+
+                                    session_xr18_frames = 0
+
+
                 time.sleep(0.01)
 
                 continue
@@ -258,6 +380,14 @@ def run_recorder(status_queue):
                         )
 
 
+                        if recorder is not None:
+
+                            # Start counting frames for this recording
+                            # session from zero.
+
+                            session_xr18_frames = 0
+
+
             # ---------------------------------------------------------------
             # Check existing USB storage
             # ---------------------------------------------------------------
@@ -284,9 +414,19 @@ def run_recorder(status_queue):
                     )
 
 
-                    # Stop recording before forgetting the USB.
+                    # -------------------------------------------------------
+                    # Print diagnostics BEFORE stopping the recorder.
+                    # -------------------------------------------------------
 
                     if recorder is not None:
+
+                        print_audio_diagnostics(
+                            session_xr18_frames,
+                            recorder,
+                        )
+
+
+                        # Stop recording before forgetting the USB.
 
                         recorder.stop()
 
@@ -331,9 +471,19 @@ def run_recorder(status_queue):
                 )
 
 
-                # Stop the current recording cleanly.
+                # -----------------------------------------------------------
+                # Print diagnostics BEFORE stopping the recorder.
+                # -----------------------------------------------------------
 
                 if recorder is not None:
+
+                    print_audio_diagnostics(
+                        session_xr18_frames,
+                        recorder,
+                    )
+
+
+                    # Stop the current recording cleanly.
 
                     recorder.stop()
 
@@ -348,60 +498,40 @@ def run_recorder(status_queue):
 
 
             # ---------------------------------------------------------------
-            # Audio diagnostics
+            # Count XR18 audio frames
             # ---------------------------------------------------------------
             #
-            # Count every successful block returned by the XR18.
+            # The XR18 provides:
             #
-            # We count bytes for now. Later we can make this more precise
-            # by counting audio frames directly.
+            #     18 channels
+            #     4 bytes per sample
             #
-
-            total_audio_reads += 1
-
-            total_audio_bytes += len(data)
-
-
-            # ---------------------------------------------------------------
-            # Periodic diagnostic output
-            # ---------------------------------------------------------------
-
-            now = time.monotonic()
-
+            # Therefore one complete audio frame is:
+            #
+            #     18 × 4 = 72 bytes
+            #
+            # len(data) / 72 therefore gives the number of complete
+            # 18-channel frames in this block.
+            #
+            # Only count frames while a recording session is active.
 
             if (
-                now - last_diagnostic_time
-                >= 10.0
+                recorder is not None
+                and recorder.recording
             ):
 
-                elapsed = (
-                    now - last_diagnostic_time
+                frames_received = (
+                    len(data)
+                    // (
+                        CHANNELS
+                        * BYTES_PER_SAMPLE
+                    )
                 )
 
 
-                rate_kb_per_second = (
-                    total_audio_bytes
-                    / elapsed
-                    / 1024
+                session_xr18_frames += (
+                    frames_received
                 )
-
-
-                print(
-                    f"AUDIO DIAGNOSTIC: "
-                    f"reads={total_audio_reads} "
-                    f"bytes={total_audio_bytes} "
-                    f"rate={rate_kb_per_second:.1f} KB/s",
-                    flush=True,
-                )
-
-
-                # Reset the counters for the next interval.
-
-                total_audio_reads = 0
-
-                total_audio_bytes = 0
-
-                last_diagnostic_time = now
 
 
             # ---------------------------------------------------------------
@@ -430,6 +560,10 @@ def run_recorder(status_queue):
                         "Recorder stopped or failed",
                         flush=True,
                     )
+
+
+                    # The recorder has already stopped itself if write()
+                    # encountered an error.
 
                     recorder = None
 
@@ -476,15 +610,26 @@ def run_recorder(status_queue):
     finally:
 
         # -------------------------------------------------------------------
-        # Stop recording
+        # Print diagnostics BEFORE stopping the recorder
         # -------------------------------------------------------------------
 
         if recorder is not None:
+
+            print_audio_diagnostics(
+                session_xr18_frames,
+                recorder,
+            )
+
+
+            # ---------------------------------------------------------------
+            # Stop recording
+            # ---------------------------------------------------------------
 
             print(
                 "Closing recording session...",
                 flush=True,
             )
+
 
             recorder.stop()
 
