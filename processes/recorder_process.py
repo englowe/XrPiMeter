@@ -15,28 +15,24 @@ The UI process is completely separate.
 
 The recorder process must never depend on the OLED or LEDs.
 
-IMPORTANT ARCHITECTURE:
+Architecture
+------------
 
-The recorder loop is split into two paths.
+Fast path:
+    - read XR18 audio
+    - meter audio
+    - write audio
 
-FAST AUDIO PATH
-    XR18 read
-    Meter processing
-    Recorder write
+Slow path:
+    - check XR18 connection/reconnection
+    - check USB storage
+    - detect XR18 audio timeout
+    - build filesystem-based recording information
+    - send status to the UI
 
-This path runs as quickly as audio arrives and must contain no
-filesystem statistics, directory scanning, or UI queue work.
-
-SLOW STATUS PATH
-    USB availability check
-    Recording statistics
-    Filesystem statistics
-    UI status message
-
-This path runs approximately once per second.
-
-This prevents filesystem operations from being performed once for
-every 1024-frame audio block.
+The slow path runs independently of whether audio is currently flowing.
+This is important because the UI must be told when the XR18 disconnects,
+even if there is no longer any successful audio read.
 """
 
 import time
@@ -64,13 +60,22 @@ from recorder import Recorder
 # Timing
 # ---------------------------------------------------------------------------
 
+# How often to attempt XR18 reconnection.
 XR18_RECONNECT_INTERVAL = 2.0
 
-# Filesystem and USB status checks are deliberately slow.
+# How often to perform USB/filesystem checks.
 USB_CHECK_INTERVAL = 1.0
 
-# UI status is also deliberately limited to approximately once per second.
+# How often to build and send a complete UI status snapshot.
 STATUS_UPDATE_INTERVAL = 1.0
+
+# Maximum time allowed without receiving actual XR18 audio.
+#
+# Occasional empty non-blocking ALSA reads are normal.
+#
+# However, if no successful audio block arrives for this long, treat the
+# XR18 audio stream as lost.
+XR18_AUDIO_TIMEOUT = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +117,11 @@ def start_recorder(usb_mount_point):
 
         return None
 
+
     recorder = Recorder(
         recording_root
     )
+
 
     if not recorder.start():
 
@@ -125,10 +132,12 @@ def start_recorder(usb_mount_point):
 
         return None
 
+
     print(
         "Recorder started",
         flush=True,
     )
+
 
     return recorder
 
@@ -148,22 +157,29 @@ def print_audio_diagnostics(
     if recorder is None:
         return
 
+
     recorder_frames = (
         recorder.total_frames_written
     )
+
 
     difference = (
         xr18_frames
         - recorder_frames
     )
 
+
     xr18_duration = (
-        xr18_frames / SAMPLE_RATE
+        xr18_frames
+        / SAMPLE_RATE
     )
 
+
     recorder_duration = (
-        recorder_frames / SAMPLE_RATE
+        recorder_frames
+        / SAMPLE_RATE
     )
+
 
     print(
         "",
@@ -227,6 +243,37 @@ def print_audio_diagnostics(
 
 
 # ---------------------------------------------------------------------------
+# Stop current recording
+# ---------------------------------------------------------------------------
+
+def stop_current_recording(
+    recorder,
+    session_xr18_frames,
+):
+    """
+    Print diagnostics and cleanly stop the current recording.
+    """
+
+    if recorder is None:
+        return
+
+
+    print_audio_diagnostics(
+        session_xr18_frames,
+        recorder,
+    )
+
+
+    print(
+        "Closing recording session...",
+        flush=True,
+    )
+
+
+    recorder.stop()
+
+
+# ---------------------------------------------------------------------------
 # Build UI status
 # ---------------------------------------------------------------------------
 
@@ -240,17 +287,15 @@ def build_status(
     """
     Build the complete status snapshot required by the UI.
 
-    IMPORTANT:
+    Only small serialisable values are returned.
 
-    This function intentionally performs filesystem-related operations
-    such as recording-size and free-space queries.
-
-    It MUST therefore only be called from the slow status path.
-
-    It must NEVER be called for every audio block.
+    Hardware objects are never sent through the multiprocessing queue.
     """
 
-    if recorder is not None and recorder.recording:
+    if (
+        recorder is not None
+        and recorder.recording
+    ):
 
         elapsed_seconds = (
             recorder.get_elapsed_seconds()
@@ -285,18 +330,22 @@ def build_status(
         free_space_gb = 0.0
         part_number = 0
 
+
     return {
         # ---------------------------------------------------------------
         # Connection state
         # ---------------------------------------------------------------
 
-        "xr18_connected": xr18.connected,
+        "xr18_connected": (
+            xr18.connected
+        ),
 
         "usb_available": (
             usb_mount_point is not None
         ),
 
         "usb_name": usb_name,
+
 
         # ---------------------------------------------------------------
         # Recording state
@@ -319,12 +368,38 @@ def build_status(
 
         "part_number": part_number,
 
+
         # ---------------------------------------------------------------
         # Meter
         # ---------------------------------------------------------------
 
         "levels": levels,
     }
+
+
+# ---------------------------------------------------------------------------
+# Send UI status
+# ---------------------------------------------------------------------------
+
+def send_status(
+    status_queue,
+    status,
+):
+    """
+    Send a status snapshot to the UI.
+
+    Recording must never stop because the UI is unavailable.
+    """
+
+    try:
+
+        status_queue.put_nowait(
+            status
+        )
+
+    except Exception:
+
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -338,21 +413,11 @@ def run_recorder(
     """
     Main entry point for the recorder process.
 
-    The recorder checks shutdown_event once per loop.
+    The fast audio path and slow status/filesystem path are deliberately
+    independent.
 
-    The loop is deliberately divided into:
-
-        FAST AUDIO PATH
-            XR18 read
-            meter processing
-            recorder write
-
-        SLOW STATUS PATH
-            USB checks
-            filesystem statistics
-            UI status queue
-
-    The slow path must never interfere unnecessarily with the audio path.
+    This means the UI continues receiving connection updates even when
+    the XR18 is disconnected and no audio blocks are arriving.
     """
 
     print(
@@ -360,13 +425,19 @@ def run_recorder(
         flush=True,
     )
 
+
     # -----------------------------------------------------------------------
-    # Hardware/software components
+    # Create components
     # -----------------------------------------------------------------------
 
     xr18 = XR18()
 
     meter = Meter()
+
+
+    # -----------------------------------------------------------------------
+    # Application state
+    # -----------------------------------------------------------------------
 
     usb_mount_point = None
 
@@ -374,15 +445,30 @@ def run_recorder(
 
     recorder = None
 
+
     # -----------------------------------------------------------------------
     # Timing state
     # -----------------------------------------------------------------------
 
-    last_xr18_reconnect = 0.0
+    now = time.monotonic()
 
-    last_usb_check = 0.0
+    last_xr18_reconnect = (
+        now
+        - XR18_RECONNECT_INTERVAL
+    )
 
-    last_status_update = 0.0
+    last_usb_check = (
+        now
+        - USB_CHECK_INTERVAL
+    )
+
+    last_status_update = (
+        now
+        - STATUS_UPDATE_INTERVAL
+    )
+
+    last_audio_time = now
+
 
     # -----------------------------------------------------------------------
     # Audio diagnostics
@@ -390,122 +476,63 @@ def run_recorder(
 
     session_xr18_frames = 0
 
+
     # -----------------------------------------------------------------------
     # Last known meter values
     # -----------------------------------------------------------------------
-    #
-    # These are retained between status updates.
-    #
-    # Meter processing itself remains on the fast audio path.
-    #
 
     levels = meter.levels
 
-    # -----------------------------------------------------------------------
-    # Main process
-    # -----------------------------------------------------------------------
 
     try:
 
         while not shutdown_event.is_set():
 
-            # ===============================================================
-            # FAST AUDIO PATH
-            # ===============================================================
-            #
-            # Everything below this point should be kept as lightweight
-            # as possible.
-            #
-            # In particular:
-            #
-            #   NO filesystem statistics
-            #   NO directory scans
-            #   NO free-space queries
-            #   NO recording-size queries
-            #   NO status_queue calls
-            #
-            # ===============================================================
-
-
-            # ---------------------------------------------------------------
-            # XR18 disconnected
-            # ---------------------------------------------------------------
-
-            if not xr18.connected:
-
-                now = time.monotonic()
-
-                if (
-                    now - last_xr18_reconnect
-                    >= XR18_RECONNECT_INTERVAL
-                ):
-
-                    last_xr18_reconnect = now
-
-                    if xr18.connect():
-
-                        print(
-                            f"XR18 connected: "
-                            f"{xr18.device_name}",
-                            flush=True,
-                        )
-
-                        # If USB is already available, start recording.
-
-                        if (
-                            usb_mount_point is not None
-                            and recorder is None
-                        ):
-
-                            recorder = start_recorder(
-                                usb_mount_point
-                            )
-
-                            if recorder is not None:
-
-                                session_xr18_frames = 0
-
-                # Avoid unnecessary CPU usage while disconnected.
-
-                time.sleep(0.01)
-
-                continue
+            # Current monotonic time is used for all scheduling.
+            now = time.monotonic()
 
 
             # ===============================================================
-            # SLOW PATH
+            # SLOW PATH: XR18 CONNECTION / RECONNECTION
             # ===============================================================
             #
-            # USB discovery is only required when we currently have no
-            # known USB mount point.
+            # This runs whether or not audio is currently flowing.
             #
-            # This is deliberately outside the normal audio processing
-            # path.
-            #
-            # ===============================================================
 
-            if usb_mount_point is None:
+            if (
+                not xr18.connected
+                and
+                now - last_xr18_reconnect
+                >= XR18_RECONNECT_INTERVAL
+            ):
 
-                usb_mount_point = find_usb()
+                last_xr18_reconnect = now
 
-                if usb_mount_point is not None:
 
-                    usb_name = get_usb_name(
-                        usb_mount_point
+                if xr18.connect():
+
+                    last_audio_time = (
+                        time.monotonic()
                     )
 
+
                     print(
-                        f"USB storage ready: "
-                        f"{usb_mount_point} "
-                        f"label={usb_name}",
+                        f"XR18 connected: "
+                        f"{xr18.device_name}",
                         flush=True,
                     )
 
-                    if recorder is None:
+
+                    # Start recording immediately if USB is already present.
+                    if (
+                        usb_mount_point is not None
+                        and recorder is None
+                    ):
 
                         recorder = start_recorder(
                             usb_mount_point
                         )
+
 
                         if recorder is not None:
 
@@ -513,154 +540,8 @@ def run_recorder(
 
 
             # ===============================================================
-            # FAST AUDIO PATH
+            # SLOW PATH: USB CHECKS
             # ===============================================================
-            #
-            # Read the next XR18 block.
-            #
-            # This should be the dominant operation in the loop.
-            #
-            # ===============================================================
-
-            length, data = xr18.read()
-
-
-            # ---------------------------------------------------------------
-            # Temporary empty read
-            # ---------------------------------------------------------------
-
-            if (
-                length <= 0
-                and data == b""
-            ):
-
-                # We deliberately do not sleep here.
-                #
-                # The XR18 is operating in non-blocking mode.
-                # The loop should return immediately and try again.
-
-                continue
-
-
-            # ---------------------------------------------------------------
-            # Genuine XR18 failure
-            # ---------------------------------------------------------------
-
-            if data is None:
-
-                print(
-                    "XR18 audio stream lost",
-                    flush=True,
-                )
-
-                if recorder is not None:
-
-                    print_audio_diagnostics(
-                        session_xr18_frames,
-                        recorder,
-                    )
-
-                    recorder.stop()
-
-                    recorder = None
-
-                xr18.disconnect()
-
-                continue
-
-
-            # ---------------------------------------------------------------
-            # Count received frames
-            # ---------------------------------------------------------------
-
-            if (
-                recorder is not None
-                and recorder.recording
-            ):
-
-                frames_received = (
-                    len(data)
-                    //
-                    (
-                        CHANNELS
-                        * BYTES_PER_SAMPLE
-                    )
-                )
-
-                session_xr18_frames += (
-                    frames_received
-                )
-
-
-            # ---------------------------------------------------------------
-            # Meter
-            # ---------------------------------------------------------------
-            #
-            # This stays on the fast path because metering requires the
-            # actual audio data.
-            #
-
-            levels = meter.process(
-                data
-            )
-
-
-            # ---------------------------------------------------------------
-            # Recorder
-            # ---------------------------------------------------------------
-            #
-            # This is the critical disk-write path.
-            #
-            # Recorder.write() is deliberately called immediately after
-            # receiving and processing the audio block.
-            #
-            # No filesystem statistics or UI work happens between the
-            # audio read and this write.
-            #
-
-            if recorder is not None:
-
-                recording_ok = recorder.write(
-                    data
-                )
-
-                if not recording_ok:
-
-                    print(
-                        "Recorder stopped or failed",
-                        flush=True,
-                    )
-
-                    recorder = None
-
-
-            # ===============================================================
-            # SLOW STATUS PATH
-            # ===============================================================
-            #
-            # This section executes approximately once per second.
-            #
-            # Previously build_status() was being called for EVERY audio
-            # block.
-            #
-            # At 48 kHz with 1024-frame blocks, that is approximately:
-            #
-            #     48000 / 1024 = 46.875 calls per second
-            #
-            # Each call could perform:
-            #
-            #     statfs()
-            #     stat()
-            #     directory scans
-            #     file-size queries
-            #
-            # This was visible in strace and was unnecessary.
-            #
-            # Now these operations happen approximately once per second.
-            #
-            # ===============================================================
-
-            now = time.monotonic()
 
             if (
                 now - last_usb_check
@@ -669,11 +550,52 @@ def run_recorder(
 
                 last_usb_check = now
 
+
+                # -----------------------------------------------------------
+                # Look for USB storage
+                # -----------------------------------------------------------
+
+                if usb_mount_point is None:
+
+                    usb_mount_point = find_usb()
+
+
+                    if usb_mount_point is not None:
+
+                        usb_name = get_usb_name(
+                            usb_mount_point
+                        )
+
+
+                        print(
+                            f"USB storage ready: "
+                            f"{usb_mount_point} "
+                            f"label={usb_name}",
+                            flush=True,
+                        )
+
+
+                        # Start recording only if the XR18 is available.
+                        if (
+                            xr18.connected
+                            and recorder is None
+                        ):
+
+                            recorder = start_recorder(
+                                usb_mount_point
+                            )
+
+
+                            if recorder is not None:
+
+                                session_xr18_frames = 0
+
+
                 # -----------------------------------------------------------
                 # Check existing USB storage
                 # -----------------------------------------------------------
 
-                if usb_mount_point is not None:
+                else:
 
                     if not usb_is_available(
                         usb_mount_point
@@ -684,29 +606,206 @@ def run_recorder(
                             flush=True,
                         )
 
-                        # Print diagnostics before stopping the recorder.
 
                         if recorder is not None:
 
-                            print_audio_diagnostics(
-                                session_xr18_frames,
+                            stop_current_recording(
                                 recorder,
+                                session_xr18_frames,
                             )
-
-                            recorder.stop()
 
                             recorder = None
 
+
                         usb_mount_point = None
+
                         usb_name = ""
 
 
-            # ---------------------------------------------------------------
-            # UI status update
-            # ---------------------------------------------------------------
+            # ===============================================================
+            # FAST PATH: READ AUDIO
+            # ===============================================================
             #
-            # Filesystem-heavy status functions are only called here.
+            # Only attempt an audio read when the XR18 is currently open.
             #
+
+            if xr18.connected:
+
+                length, data = xr18.read()
+
+
+                # -----------------------------------------------------------
+                # Successful audio
+                # -----------------------------------------------------------
+
+                if (
+                    length > 0
+                    and data
+                ):
+
+                    # Successful audio proves the stream is alive.
+                    last_audio_time = (
+                        time.monotonic()
+                    )
+
+
+                    # -------------------------------------------------------
+                    # Count frames
+                    # -------------------------------------------------------
+
+                    if (
+                        recorder is not None
+                        and recorder.recording
+                    ):
+
+                        frames_received = (
+                            len(data)
+                            //
+                            (
+                                CHANNELS
+                                * BYTES_PER_SAMPLE
+                            )
+                        )
+
+
+                        session_xr18_frames += (
+                            frames_received
+                        )
+
+
+                    # -------------------------------------------------------
+                    # Meter
+                    # -------------------------------------------------------
+
+                    levels = meter.process(
+                        data
+                    )
+
+
+                    # -------------------------------------------------------
+                    # Write audio
+                    # -------------------------------------------------------
+
+                    if recorder is not None:
+
+                        recording_ok = (
+                            recorder.write(
+                                data
+                            )
+                        )
+
+
+                        if not recording_ok:
+
+                            print(
+                                "Recorder stopped or failed",
+                                flush=True,
+                            )
+
+                            recorder = None
+
+
+                # -----------------------------------------------------------
+                # Genuine ALSA error
+                # -----------------------------------------------------------
+
+                elif data is None:
+
+                    print(
+                        "XR18 audio stream lost",
+                        flush=True,
+                    )
+
+
+                    if recorder is not None:
+
+                        stop_current_recording(
+                            recorder,
+                            session_xr18_frames,
+                        )
+
+                        recorder = None
+
+
+                    xr18.disconnect()
+
+
+                # -----------------------------------------------------------
+                # Empty non-blocking read
+                # -----------------------------------------------------------
+
+                else:
+
+                    # Do nothing immediately.
+                    #
+                    # The audio watchdog below decides whether the absence
+                    # of audio has lasted too long.
+
+
+                    pass
+
+
+            # ===============================================================
+            # SLOW PATH: XR18 AUDIO WATCHDOG
+            # ===============================================================
+            #
+            # IMPORTANT:
+            #
+            # This is outside the successful-audio branch.
+            #
+            # Therefore it continues running even if ALSA repeatedly
+            # returns empty reads.
+            #
+
+            now = time.monotonic()
+
+
+            if (
+                xr18.connected
+                and
+                now - last_audio_time
+                >= XR18_AUDIO_TIMEOUT
+            ):
+
+                print(
+                    "XR18 audio timeout - "
+                    "no audio received",
+                    flush=True,
+                )
+
+
+                if recorder is not None:
+
+                    stop_current_recording(
+                        recorder,
+                        session_xr18_frames,
+                    )
+
+                    recorder = None
+
+
+                xr18.disconnect()
+
+
+            # ===============================================================
+            # SLOW PATH: UI STATUS
+            # ===============================================================
+            #
+            # IMPORTANT:
+            #
+            # This is outside every audio branch.
+            #
+            # The UI therefore receives status whether:
+            #
+            #   - audio is flowing
+            #   - ALSA returns empty reads
+            #   - the XR18 times out
+            #   - the XR18 is disconnected
+            #   - the XR18 is reconnecting
+            #
+
+            now = time.monotonic()
+
 
             if (
                 now - last_status_update
@@ -714,6 +813,7 @@ def run_recorder(
             ):
 
                 last_status_update = now
+
 
                 status = build_status(
                     xr18=xr18,
@@ -723,19 +823,30 @@ def run_recorder(
                     levels=levels,
                 )
 
-                try:
 
-                    status_queue.put_nowait(
-                        status
-                    )
+                send_status(
+                    status_queue,
+                    status,
+                )
 
-                except Exception:
 
-                    # UI may be restarting or unavailable.
-                    #
-                    # Recording must continue regardless.
+            # ===============================================================
+            # Idle protection
+            # ===============================================================
+            #
+            # When no audio is available, avoid a full-speed CPU loop.
+            #
+            # This does not run during successful audio because that would
+            # unnecessarily delay the recording path.
+            #
 
-                    pass
+            if (
+                not xr18.connected
+            ):
+
+                time.sleep(
+                    0.01
+                )
 
 
     finally:
@@ -745,31 +856,20 @@ def run_recorder(
             flush=True,
         )
 
+
         # -------------------------------------------------------------------
-        # Diagnostics
+        # Stop current recording
         # -------------------------------------------------------------------
 
         if recorder is not None:
 
-            print_audio_diagnostics(
-                session_xr18_frames,
+            stop_current_recording(
                 recorder,
+                session_xr18_frames,
             )
-
-        # -------------------------------------------------------------------
-        # Stop recorder
-        # -------------------------------------------------------------------
-
-        if recorder is not None:
-
-            print(
-                "Closing recording session...",
-                flush=True,
-            )
-
-            recorder.stop()
 
             recorder = None
+
 
         # -------------------------------------------------------------------
         # Disconnect XR18
@@ -779,13 +879,10 @@ def run_recorder(
 
             xr18.disconnect()
 
+
         # -------------------------------------------------------------------
-        # Queue shutdown
+        # Prevent multiprocessing.Queue shutdown delays
         # -------------------------------------------------------------------
-        #
-        # We don't need the recorder process to wait for a multiprocessing
-        # queue feeder thread to flush an obsolete final UI status message.
-        #
 
         try:
 
@@ -794,6 +891,7 @@ def run_recorder(
         except Exception:
 
             pass
+
 
         print(
             "RECORDER PROCESS STOPPED",
